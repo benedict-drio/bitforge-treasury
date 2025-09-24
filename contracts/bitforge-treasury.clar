@@ -382,3 +382,85 @@
         )
     )
 )
+
+;; Proposal Execution Function
+;; Executes approved proposals by transferring funds to the specified target
+;; Can only be called after voting period ends and if proposal passed
+;;
+;; Process:
+;; 1. Validates proposal exists and hasn't been executed
+;; 2. Confirms voting period has ended
+;; 3. Verifies proposal passed (more yes votes than no votes)
+;; 4. Transfers approved amount to target address
+;; 5. Marks proposal as executed to prevent re-execution
+;;
+;; @param proposal-id: ID of the proposal to execute
+;; @returns: ok(true) on successful execution
+(define-public (execute-approved-proposal (proposal-id uint))
+    (begin
+        (try! (assert-protocol-initialized))
+        
+        (let (
+            (proposal-data (unwrap! (map-get? treasury-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        )
+            (asserts! (not (get executed proposal-data)) ERR_UNAUTHORIZED)
+            (asserts! (>= stacks-block-height (get expires-at proposal-data)) ERR_PROPOSAL_EXPIRED)
+            (asserts! (> (get yes-votes proposal-data) (get no-votes proposal-data)) ERR_UNAUTHORIZED)
+            
+            ;; Execute approved treasury allocation
+            (try! (as-contract (stx-transfer? (get amount proposal-data) 
+                                            (as-contract tx-sender) 
+                                            (get target proposal-data))))
+            
+            ;; Mark proposal as successfully executed
+            (map-set treasury-proposals proposal-id (merge proposal-data {executed: true}))
+            (ok true)
+        )
+    )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Query Governance Token Balance
+;; Returns the governance token balance for a given account
+;; @param account: Principal to check balance for
+;; @returns: ok(balance) - governance token balance
+(define-read-only (get-governance-balance (account principal))
+    (ok (default-to u0 (map-get? token-balances account)))
+)
+
+;; Query Total Token Supply
+;; Returns the total number of governance tokens in circulation
+;; @returns: ok(total-supply) - total governance tokens minted
+(define-read-only (get-total-token-supply)
+    (ok (var-get total-supply))
+)
+
+;; Query Treasury Proposal
+;; Returns the full details of a specific proposal
+;; @param proposal-id: ID of the proposal to query
+;; @returns: ok(proposal-data) or none if proposal doesn't exist
+(define-read-only (get-treasury-proposal (proposal-id uint))
+    (ok (map-get? treasury-proposals proposal-id))
+)
+
+;; Query User Deposit Information
+;; Returns deposit details for a specific user including lock status
+;; @param account: Principal to check deposit info for
+;; @returns: ok(deposit-info) or none if no deposit exists
+(define-read-only (get-user-deposit-info (account principal))
+    (ok (map-get? user-deposits account))
+)
+
+;; Query Protocol Status
+;; Returns overall protocol statistics and configuration
+;; @returns: ok(status-object) with protocol metrics
+(define-read-only (get-protocol-status)
+    (ok {
+        initialized: (var-get protocol-initialized),
+        total-supply: (var-get total-supply),
+        proposal-count: (var-get proposal-counter),
+        minimum-deposit: (var-get minimum-deposit),
+        lock-period: (var-get lock-period)
+    })
+)
