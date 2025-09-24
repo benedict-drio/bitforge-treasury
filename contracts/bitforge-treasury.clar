@@ -251,3 +251,134 @@
         (mint-governance-tokens tx-sender amount)
     )
 )
+
+;; Unstake Withdrawal Function
+;; Allows users to withdraw their STX after the time-lock period expires
+;; Burns corresponding governance tokens to maintain proportionality
+;;
+;; Process:
+;; 1. Validates user has deposit record and time-lock has expired
+;; 2. Burns governance tokens equal to withdrawal amount
+;; 3. Transfers STX from treasury back to user
+;;
+;; @param amount: STX amount to withdraw (in microSTX)
+;; @returns: ok(transfer-result) on successful withdrawal
+(define-public (unstake-withdrawal (amount uint))
+    (begin
+        (try! (assert-protocol-initialized))
+        
+        (let (
+            (deposit-record (unwrap! (map-get? user-deposits tx-sender) ERR_UNAUTHORIZED))
+        )
+            (asserts! (>= stacks-block-height (get lock-until deposit-record)) ERR_LOCKED_PERIOD)
+            (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+            
+            ;; Burn governance tokens to maintain proportionality
+            (try! (burn-governance-tokens tx-sender amount))
+            
+            ;; Release STX from treasury back to user
+            (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender))
+        )
+    )
+)
+
+;; Treasury Proposal Submission
+;; Allows governance token holders to propose fund allocations from the treasury
+;; 
+;; Process:
+;; 1. Validates all input parameters
+;; 2. Confirms proposer has governance tokens (voting power)
+;; 3. Creates new proposal with unique ID
+;; 4. Sets expiration based on specified duration
+;;
+;; @param description: Text description of the proposal (max 256 chars)
+;; @param amount: STX amount to transfer if approved
+;; @param target: Recipient address for the funds
+;; @param duration: Voting period duration in blocks
+;; @returns: ok(proposal-id) - the ID of the created proposal
+(define-public (submit-treasury-proposal 
+    (description (string-ascii 256))
+    (amount uint)
+    (target principal)
+    (duration uint)
+)
+    (begin
+        (try! (assert-protocol-initialized))
+        
+        ;; Comprehensive input validation
+        (asserts! (> (len description) u0) ERR_INVALID_DESCRIPTION)
+        (asserts! (> amount u0) ERR_ZERO_AMOUNT)
+        (asserts! (not (is-eq target (as-contract tx-sender))) ERR_INVALID_TARGET)
+        (asserts! (and (>= duration MINIMUM_PROPOSAL_DURATION) 
+                       (<= duration MAXIMUM_PROPOSAL_DURATION)) ERR_INVALID_DURATION)
+        
+        (let (
+            (proposer-voting-power (unwrap! (map-get? token-balances tx-sender) ERR_UNAUTHORIZED))
+            (new-proposal-id (+ (var-get proposal-counter) u1))
+        )
+            (asserts! (> proposer-voting-power u0) ERR_UNAUTHORIZED)
+            
+            ;; Create new treasury proposal
+            (map-set treasury-proposals new-proposal-id {
+                proposer: tx-sender,
+                description: description,
+                amount: amount,
+                target: target,
+                expires-at: (+ stacks-block-height duration),
+                executed: false,
+                yes-votes: u0,
+                no-votes: u0
+            })
+            
+            (var-set proposal-counter new-proposal-id)
+            (ok new-proposal-id)
+        )
+    )
+)
+
+;; Governance Voting Function
+;; Allows governance token holders to vote on active proposals
+;; Votes are weighted by the number of governance tokens held
+;;
+;; Process:
+;; 1. Validates proposal exists and is still active
+;; 2. Confirms voter has governance tokens and hasn't voted yet
+;; 3. Records the vote to prevent double-voting
+;; 4. Updates proposal vote tallies weighted by governance token balance
+;;
+;; @param proposal-id: ID of the proposal to vote on
+;; @param support-proposal: true for yes vote, false for no vote
+;; @returns: ok(true) on successful vote
+(define-public (cast-governance-vote (proposal-id uint) (support-proposal bool))
+    (begin
+        (try! (assert-protocol-initialized))
+        
+        (let (
+            (proposal-data (unwrap! (map-get? treasury-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (voter-power (get-voting-power tx-sender))
+        )
+            (asserts! (> voter-power u0) ERR_UNAUTHORIZED)
+            (asserts! (< stacks-block-height (get expires-at proposal-data)) ERR_PROPOSAL_EXPIRED)
+            (asserts! (is-none (map-get? proposal-votes {proposal-id: proposal-id, voter: tx-sender})) ERR_ALREADY_VOTED)
+            
+            ;; Record governance vote to prevent double-voting
+            (map-set proposal-votes {proposal-id: proposal-id, voter: tx-sender} support-proposal)
+            
+            ;; Update proposal vote tallies weighted by governance tokens
+            (map-set treasury-proposals proposal-id 
+                (merge proposal-data 
+                    {
+                        yes-votes: (if support-proposal 
+                            (+ (get yes-votes proposal-data) voter-power)
+                            (get yes-votes proposal-data)),
+                        no-votes: (if support-proposal
+                            (get no-votes proposal-data)
+                            (+ (get no-votes proposal-data) voter-power))
+                    }
+                )
+            )
+            
+            (ok true)
+        )
+    )
+)
