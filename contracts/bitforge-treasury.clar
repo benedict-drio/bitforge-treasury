@@ -126,3 +126,128 @@
         no-votes: uint
     }
 )
+
+;; Vote Tracking Registry
+;; Prevents double-voting by tracking who voted on which proposals
+;; Key: {proposal-id, voter} -> Value: true (prevents duplicate entries)
+(define-map proposal-votes {proposal-id: uint, voter: principal} bool)
+
+;; PRIVATE UTILITY FUNCTIONS
+
+;; Owner Permission Check
+;; Returns true if the transaction sender is the contract owner
+;; Used to restrict initialization to the deployer
+(define-private (is-protocol-owner)
+    (is-eq tx-sender CONTRACT_OWNER)
+)
+
+;; Protocol Initialization Check
+;; Ensures the protocol has been properly initialized before use
+;; Returns ok(true) if initialized, throws ERR_NOT_INITIALIZED otherwise
+(define-private (assert-protocol-initialized)
+    (ok (asserts! (var-get protocol-initialized) ERR_NOT_INITIALIZED))
+)
+
+;; Voting Power Query
+;; Returns the governance token balance (voting power) for a given principal
+;; Returns 0 if the principal has no tokens
+(define-private (get-voting-power (voter principal))
+    (default-to u0 (map-get? token-balances voter))
+)
+
+;; Internal Token Transfer
+;; Safely transfers governance tokens between accounts with balance validation
+;; Updates both sender and recipient balances atomically
+;; @param sender: Account to debit tokens from
+;; @param recipient: Account to credit tokens to  
+;; @param amount: Number of tokens to transfer
+(define-private (internal-token-transfer (sender principal) (recipient principal) (amount uint))
+    (let (
+        (sender-balance (default-to u0 (map-get? token-balances sender)))
+        (recipient-balance (default-to u0 (map-get? token-balances recipient)))
+    )
+        (asserts! (>= sender-balance amount) ERR_INSUFFICIENT_BALANCE)
+        (map-set token-balances sender (- sender-balance amount))
+        (map-set token-balances recipient (+ recipient-balance amount))
+        (ok true)
+    )
+)
+
+;; Governance Token Minting
+;; Creates new governance tokens and assigns them to an account
+;; Updates both individual balance and total supply
+;; @param account: Principal to receive newly minted tokens
+;; @param amount: Number of tokens to create
+(define-private (mint-governance-tokens (account principal) (amount uint))
+    (let (
+        (current-balance (default-to u0 (map-get? token-balances account)))
+    )
+        (map-set token-balances account (+ current-balance amount))
+        (var-set total-supply (+ (var-get total-supply) amount))
+        (ok true)
+    )
+)
+
+;; Governance Token Burning
+;; Destroys governance tokens from an account's balance
+;; Updates both individual balance and total supply
+;; @param account: Principal to burn tokens from
+;; @param amount: Number of tokens to destroy
+(define-private (burn-governance-tokens (account principal) (amount uint))
+    (let (
+        (current-balance (default-to u0 (map-get? token-balances account)))
+    )
+        (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+        (map-set token-balances account (- current-balance amount))
+        (var-set total-supply (- (var-get total-supply) amount))
+        (ok true)
+    )
+)
+
+;; CORE PROTOCOL FUNCTIONS
+
+;; Protocol Initialization
+;; One-time setup function that enables the treasury protocol
+;; Can only be called by the contract owner
+;; Prevents accidental usage before proper configuration
+;; @returns: ok(true) on success
+(define-public (initialize-protocol)
+    (begin
+        (asserts! (is-protocol-owner) ERR_OWNER_ONLY)
+        (asserts! (not (var-get protocol-initialized)) ERR_ALREADY_INITIALIZED)
+        (var-set protocol-initialized true)
+        (ok true)
+    )
+)
+
+;; Stake Deposit Function
+;; Allows users to deposit STX and receive proportional governance tokens
+;; Implements time-lock mechanism to prevent manipulation
+;; 
+;; Process:
+;; 1. Validates deposit amount meets minimum threshold
+;; 2. Transfers STX from user to treasury contract
+;; 3. Records deposit with time-lock information
+;; 4. Mints governance tokens equal to STX deposited (1:1 ratio)
+;;
+;; @param amount: STX amount to deposit (in microSTX)
+;; @returns: ok(true) on successful deposit
+(define-public (stake-deposit (amount uint))
+    (begin
+        (try! (assert-protocol-initialized))
+        (asserts! (>= amount (var-get minimum-deposit)) ERR_BELOW_MINIMUM)
+        
+        ;; Secure STX transfer to treasury contract
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Register user deposit with time-lock
+        (map-set user-deposits tx-sender {
+            amount: amount,
+            lock-until: (+ stacks-block-height (var-get lock-period)),
+            last-reward-block: stacks-block-height
+        })
+        
+        ;; Issue governance tokens proportional to deposit (1:1 ratio)
+        (mint-governance-tokens tx-sender amount)
+    )
+)
